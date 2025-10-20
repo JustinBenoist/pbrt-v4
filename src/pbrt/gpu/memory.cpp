@@ -61,11 +61,8 @@ void CUDATrackedMemoryResource::PrefetchToGPU() const {
     LOG_VERBOSE("Prefetching %d allocations to GPU memory", allocations.size());
     size_t bytes = 0;
     for (auto iter : allocations) {
-        cudaMemLocation memloc;
-        memloc.type = cudaMemLocationType::cudaMemLocationTypeDevice;
-        memloc.id = deviceIndex;
         CUDA_CHECK(
-            cudaMemPrefetchAsync(iter.first, iter.second, memloc, 0 /* stream */));
+            cudaMemPrefetchAsync(iter.first, iter.second, deviceIndex, 0 /* stream */));
         bytes += iter.second;
     }
     CUDA_CHECK(cudaDeviceSynchronize());
