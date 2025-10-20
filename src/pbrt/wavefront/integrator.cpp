@@ -618,10 +618,13 @@ void WavefrontPathIntegrator::PrefetchGPUAllocations() {
         // performance. (This makes it possible to use the values of things
         // like WavefrontPathIntegrator::haveSubsurface to conditionally launch
         // kernels according to what's in the scene...)
+        cudaMemLocation memloc;
+        memloc.type = cudaMemLocationType::cudaMemLocationTypeDevice;
+        memloc.id = deviceIndex;
         CUDA_CHECK(cudaMemAdvise(this, sizeof(*this), cudaMemAdviseSetReadMostly,
-                                 /* ignored argument */ 0));
+                                 /* ignored argument */ memloc));
         CUDA_CHECK(cudaMemAdvise(this, sizeof(*this), cudaMemAdviseSetPreferredLocation,
-                                 deviceIndex));
+                                 memloc));
 
         // Copy all of the scene data structures over to GPU memory.  This
         // ensures that there isn't a big performance hitch for the first batch

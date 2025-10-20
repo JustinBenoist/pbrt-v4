@@ -49,10 +49,10 @@ void GPUInit() {
         CHECK(deviceProperties.canMapHostMemory);
 
         std::string deviceString = StringPrintf(
-            "CUDA device %d (%s) with %f MiB, %d SMs running at %f MHz "
+            "CUDA device %d (%s) with %f MiB, %d SMs"
             "with shader model %d.%d",
             i, deviceProperties.name, deviceProperties.totalGlobalMem / (1024. * 1024.),
-            deviceProperties.multiProcessorCount, deviceProperties.clockRate / 1000.,
+            deviceProperties.multiProcessorCount,
             deviceProperties.major, deviceProperties.minor);
         LOG_VERBOSE("%s", deviceString);
         devices += deviceString + "\n";
