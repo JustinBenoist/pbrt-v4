@@ -2749,6 +2749,292 @@ std::unique_ptr<MLTIntegrator> MLTIntegrator::Create(
                                            largeStepProbability, regularize);
 }
 
+// PSSMLTIntegrator Method Definitions
+SampledSpectrum PSSMLTIntegrator::L(ScratchBuffer &scratchBuffer, MLTSampler &sampler,
+                                 int depth, Point2f *pRaster,
+                                 SampledWavelengths *lambda) {
+    if (lights.empty())
+        return SampledSpectrum(0.f);
+    SampledSpectrum L;
+
+    // *******************************************************
+    // Sample the camera subpath using PSS Sampler
+    // *******************************************************
+    // Sample wavelengths for MLT path
+    sampler.StartStream(cameraStreamIndex);
+    if (Options->disableWavelengthJitter)
+        *lambda = camera.GetFilm().SampleWavelengths(0.5);
+    else
+        *lambda = camera.GetFilm().SampleWavelengths(sampler.Get1D());
+
+    // Generate a camera subpath with exactly _t_ vertices
+    Vertex *cameraVertices = scratchBuffer.Alloc<Vertex[]>(maxDepth + 2);
+    // Compute camera sample for MLT camera path
+    Bounds2f sampleBounds = camera.GetFilm().SampleBounds();
+    *pRaster = sampleBounds.Lerp(sampler.GetPixel2D());
+    CameraSample cameraSample;
+    cameraSample.pFilm = *pRaster;
+    cameraSample.time = sampler.Get1D();
+    cameraSample.pLens = sampler.Get2D();
+
+    // Generate camera ray for MLT camera path
+    pstd::optional<CameraRayDifferential> crd =
+        camera.GenerateRayDifferential(cameraSample, *lambda);
+    if (!crd || !crd->weight)
+        return SampledSpectrum(0.f);
+    Float rayDiffScale =
+        std::max<Float>(.125, 1 / std::sqrt((Float)sampler.SamplesPerPixel()));
+    crd->ray.ScaleDifferentials(rayDiffScale);
+
+    int nCamera = GenerateCameraSubpath(*this, crd->ray, *lambda, &sampler, scratchBuffer, 
+                                        maxDepth + 2, camera, cameraVertices, regularize);
+    
+    
+    // *******************************************************
+    // Sample the light subpath using PSS Sampler
+    // *******************************************************
+    sampler.StartStream(lightStreamIndex);
+    Vertex *lightVertices = scratchBuffer.Alloc<Vertex[]>(maxDepth + 1);
+    int nLight = GenerateLightSubpath(*this, *lambda, &sampler, camera, scratchBuffer, 
+                                       maxDepth + 1, cameraVertices[0].time(), lightSampler,
+                                       lightVertices, regularize);
+
+    // Run all the strategies and add their contribution
+    sampler.StartStream(connectionStreamIndex);
+    for (int t = 1; t <= nCamera; ++t)  {
+        for (int s = 0; s <= nLight; ++s) {
+            int depth = t + s - 2;
+            if ((s == 1 && t == 1) || depth < 0 || depth > maxDepth)
+                continue;
+
+            // Execute connection strategy and return the radiance estimate
+            pstd::optional<Point2f> pRasterNew;
+            SampledSpectrum Lpath = ConnectBDPT(*this, *lambda, lightVertices,
+                                                 cameraVertices, s, t, lightSampler, 
+                                                 camera, &sampler, &pRasterNew);
+            if (t != 1){
+                L += Lpath;
+            }
+            else if (Lpath) {
+                CHECK(pRasterNew.has_value());
+                camera.GetFilm().AddSplat(*pRasterNew, Lpath, *lambda);
+            }
+            // ATTENTION À ÇA
+            // if (pRasterNew)
+            //     *pRaster = *pRasterNew;
+        }
+    }
+    // return crd->weight * L;
+    return L / maxDepth;
+}
+
+void PSSMLTIntegrator::Render() {
+    // Handle statistics and debugstart for PSSMLTIntegrator
+    if (Options->recordPixelStatistics)
+        StatsEnablePixelStats(camera.GetFilm().PixelBounds(),
+                              RemoveExtension(camera.GetFilm().GetFilename()));
+
+    if (!Options->debugStart.empty()) {
+        std::vector<std::string> c = SplitString(Options->debugStart, ',');
+        if (c.empty())
+            ErrorExit("Didn't find comma-separated values after --debugstart: %s",
+                      Options->debugStart);
+
+        int depth;
+        if (!Atoi(c[0], &depth))
+            ErrorExit("Unable to decode first --debugstart value: %s", c[0]);
+
+        pstd::span<const std::string> span = pstd::MakeSpan(c);
+        span.remove_prefix(1);
+        DebugMLTSampler sampler = DebugMLTSampler::Create(span, nSampleStreams);
+
+        Point2f pRaster;
+        SampledWavelengths lambda;
+        ScratchBuffer scratchBuffer(65536);
+        (void)L(scratchBuffer, sampler, depth, &pRaster, &lambda);
+        return;
+    }
+
+    thread_local MLTSampler *threadSampler = nullptr;
+    thread_local int threadDepth;
+    CheckCallbackScope _([&]() -> std::string {
+        return StringPrintf("Rendering failed. Debug with --debugstart %d,%s\"\n",
+                            threadDepth, threadSampler->DumpState());
+    });
+
+    // Generate bootstrap samples and compute normalization constant $b$
+    Timer timer;
+    int nBootstrapSamples = nBootstrap * (maxDepth + 1);
+    std::vector<Float> bootstrapWeights(nBootstrapSamples, 0);
+    // Allocate scratch buffers for MLT samples
+    ThreadLocal<ScratchBuffer> threadScratchBuffers([]() { return ScratchBuffer(); });
+
+    // Generate bootstrap samples in parallel
+    ProgressReporter progress(nBootstrap, "Generating bootstrap paths", Options->quiet);
+    ParallelFor(0, nBootstrap, [&](int64_t start, int64_t end) {
+        ScratchBuffer &buf = threadScratchBuffers.Get();
+        for (int64_t i = start; i < end; ++i) {
+            // Generate _i_th bootstrap sample
+            for (int depth = 0; depth <= maxDepth; ++depth) {
+                int rngIndex = i * (maxDepth + 1) + depth;
+                MLTSampler sampler(mutationsPerPixel, rngIndex, sigma,
+                                   largeStepProbability, nSampleStreams);
+                threadSampler = &sampler;
+                threadDepth = depth;
+                // Evaluate path radiance using _sampler_ and update _bootstrapWeights_
+                Point2f pRaster;
+                SampledWavelengths lambda;
+                SampledSpectrum L_i = L(buf, sampler, depth, &pRaster, &lambda);
+                bootstrapWeights[rngIndex] = c(L_i, lambda);
+
+                buf.Reset();
+            }
+        }
+        progress.Update(end - start);
+    });
+    progress.Done();
+
+    if (std::accumulate(bootstrapWeights.begin(), bootstrapWeights.end(), 0.) == 0.)
+        ErrorExit("No light carrying paths found during bootstrap sampling! "
+                  "Are you trying to render a black image?");
+    AliasTable bootstrapTable(bootstrapWeights);
+    Float b = Float(maxDepth + 1) / bootstrapWeights.size() *
+              std::accumulate(bootstrapWeights.begin(), bootstrapWeights.end(), 0.);
+
+    // Set up connection to display server, if enabled
+    std::atomic<int> finishedChains(0);
+    if (!Options->displayServer.empty()) {
+        DisplayDynamic(
+            camera.GetFilm().GetFilename(),
+            Point2i(camera.GetFilm().PixelBounds().Diagonal()), {"R", "G", "B"},
+            [&](Bounds2i bounds, pstd::span<pstd::span<float>> displayValue) {
+                Film film = camera.GetFilm();
+                Bounds2i pixelBounds = film.PixelBounds();
+                int index = 0;
+                for (Point2i p : bounds) {
+                    Float finishedPixelMutations =
+                        Float(finishedChains.load(std::memory_order_relaxed)) /
+                        Float(nChains) * mutationsPerPixel;
+                    Float scale = b / std::max<Float>(1, finishedPixelMutations);
+                    RGB rgb = film.GetPixelRGB(pixelBounds.pMin + p, scale);
+                    for (int c = 0; c < 3; ++c)
+                        displayValue[c][index] = rgb[c];
+                    ++index;
+                }
+            });
+    }
+
+    // Follow _nChains_ Markov chains to render image
+    Film film = camera.GetFilm();
+    int64_t nTotalMutations =
+        (int64_t)film.SampleBounds().Area() * (int64_t)mutationsPerPixel;
+    ProgressReporter progressRender(nChains, "Rendering", Options->quiet);
+    // Run _nChains_ Markov chains in parallel
+    ParallelFor(0, nChains, [&](int i) {
+        ScratchBuffer &scratchBuffer = threadScratchBuffers.Get();
+        // Compute number of mutations to apply in current Markov chain
+        int64_t nChainMutations =
+            std::min((i + 1) * nTotalMutations / nChains, nTotalMutations) -
+            i * nTotalMutations / nChains;
+
+        // Select initial state from the set of bootstrap samples
+        RNG rng(i);
+        int bootstrapIndex = bootstrapTable.Sample(rng.Uniform<Float>());
+        int depth = bootstrapIndex % (maxDepth + 1);
+        threadDepth = depth;
+
+        // Initialize local variables for selected state
+        MLTSampler sampler(mutationsPerPixel, bootstrapIndex, sigma, largeStepProbability,
+                           nSampleStreams);
+        threadSampler = &sampler;
+        Point2f pCurrent;
+        SampledWavelengths lambdaCurrent;
+        SampledSpectrum LCurrent =
+            L(scratchBuffer, sampler, depth, &pCurrent, &lambdaCurrent);
+
+        // Run the Markov chain for _nChainMutations_ steps
+        for (int64_t j = 0; j < nChainMutations; ++j) {
+            StatsReportPixelStart(Point2i(pCurrent));
+            sampler.StartIteration();
+            // Generate proposed sample and compute its radiance
+            Point2f pProposed;
+            SampledWavelengths lambdaProposed;
+            SampledSpectrum LProposed =
+                L(scratchBuffer, sampler, depth, &pProposed, &lambdaProposed);
+
+            // Compute acceptance probability for proposed sample
+            Float cProposed = c(LProposed, lambdaProposed);
+            Float cCurrent = c(LCurrent, lambdaCurrent);
+            Float accept = std::min<Float>(1, cProposed / cCurrent);
+
+            // Splat both current and proposed samples to _film_
+            if (accept > 0)
+                film.AddSplat(pProposed, LProposed * accept / cProposed, lambdaProposed);
+            film.AddSplat(pCurrent, LCurrent * (1 - accept) / cCurrent, lambdaCurrent);
+
+            // Accept or reject the proposal
+            if (rng.Uniform<Float>() < accept) {
+                StatsReportPixelEnd(Point2i(pCurrent));
+                StatsReportPixelStart(Point2i(pProposed));
+                pCurrent = pProposed;
+                LCurrent = LProposed;
+                lambdaCurrent = lambdaProposed;
+                sampler.Accept();
+                ++acceptedMutations;
+            } else
+                sampler.Reject();
+
+            ++totalMutations;
+            scratchBuffer.Reset();
+            StatsReportPixelEnd(Point2i(pCurrent));
+        }
+
+        ++finishedChains;
+        progressRender.Update(1);
+    });
+
+    progressRender.Done();
+
+    // Store final image computed with MLT
+    ImageMetadata metadata;
+    metadata.renderTimeSeconds = timer.ElapsedSeconds();
+    camera.InitMetadata(&metadata);
+    camera.GetFilm().WriteImage(metadata, b / mutationsPerPixel);
+    DisconnectFromDisplayServer();
+}
+
+std::string PSSMLTIntegrator::ToString() const {
+    return StringPrintf("[ PSSMLTIntegrator camera: %s maxDepth: %d nBootstrap: %d "
+                        "nChains: %d mutationsPerPixel: %d sigma: %f "
+                        "largeStepProbability: %f lightSampler: %s regularize: %s ]",
+                        camera, maxDepth, nBootstrap, nChains, mutationsPerPixel, sigma,
+                        largeStepProbability, lightSampler, regularize);
+}
+
+std::unique_ptr<PSSMLTIntegrator> PSSMLTIntegrator::Create(
+    const ParameterDictionary &parameters, Camera camera, Primitive aggregate,
+    std::vector<Light> lights, const FileLoc *loc) {
+    if (!camera.Is<PerspectiveCamera>())
+        ErrorExit("Only the \"perspective\" camera is currently supported with the "
+                  "\"pssmlt\" integrator.");
+    int maxDepth = parameters.GetOneInt("maxdepth", 5);
+    int nBootstrap = parameters.GetOneInt("bootstrapsamples", 100000);
+    int64_t nChains = parameters.GetOneInt("chains", 1000);
+    int mutationsPerPixel = parameters.GetOneInt("mutationsperpixel", 100);
+    if (Options->pixelSamples)
+        mutationsPerPixel = *Options->pixelSamples;
+    Float largeStepProbability = parameters.GetOneFloat("largestepprobability", 0.3f);
+    Float sigma = parameters.GetOneFloat("sigma", .01f);
+    if (Options->quickRender) {
+        mutationsPerPixel = std::max(1, mutationsPerPixel / 16);
+        nBootstrap = std::max(1, nBootstrap / 16);
+    }
+    bool regularize = parameters.GetOneBool("regularize", false);
+    return std::make_unique<PSSMLTIntegrator>(camera, aggregate, lights, maxDepth,
+                                           nBootstrap, nChains, mutationsPerPixel, sigma,
+                                           largeStepProbability, regularize);
+}
+
 STAT_RATIO("Stochastic Progressive Photon Mapping/Visible points checked per photon "
            "intersection",
            visiblePointsChecked, totalPhotonSurfaceInteractions);
@@ -3673,6 +3959,8 @@ std::unique_ptr<Integrator> Integrator::Create(
             BDPTIntegrator::Create(parameters, camera, sampler, aggregate, lights, loc);
     else if (name == "mlt")
         integrator = MLTIntegrator::Create(parameters, camera, aggregate, lights, loc);
+    else if (name == "pssmlt")
+        integrator = PSSMLTIntegrator::Create(parameters, camera, aggregate, lights, loc);
     else if (name == "ambientocclusion")
         integrator = AOIntegrator::Create(parameters, &colorSpace->illuminant, camera,
                                           sampler, aggregate, lights, loc);

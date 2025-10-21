@@ -1,6 +1,7 @@
 Integrator "mlt"
     "integer maxdepth" [ 13 ]
     "float largestepprobability" [ 0.05 ]
+    "integer mutationsperpixel" [ 25 ]
 Transform [ 0.137285 -0.0319925 -0.990015 -0 -0 0.999478 -0.0322983 -0 -0.990531 -0.00443405 -0.137212 -0 -2.84124 -1.49616 3.74927 1  ]
 Sampler "sobol"
     "integer pixelsamples" [ 64 ]

@@ -431,6 +431,56 @@ class MLTIntegrator : public Integrator {
     Float sigma, largeStepProbability;
     int nChains;
 };
+class PSSMLTIntegrator : public Integrator {
+  public:
+    // MLTIntegrator Public Methods
+    PSSMLTIntegrator(Camera camera, Primitive aggregate, std::vector<Light> lights,
+                  int maxDepth, int nBootstrap, int nChains, int mutationsPerPixel,
+                  Float sigma, Float largeStepProbability, bool regularize)
+        : Integrator(aggregate, lights),
+          lightSampler(new PowerLightSampler(lights, Allocator())),
+          camera(camera),
+          maxDepth(maxDepth),
+          nBootstrap(nBootstrap),
+          nChains(nChains),
+          mutationsPerPixel(mutationsPerPixel),
+          sigma(sigma),
+          largeStepProbability(largeStepProbability),
+          regularize(regularize) {}
+
+    void Render();
+
+    static std::unique_ptr<PSSMLTIntegrator> Create(const ParameterDictionary &parameters,
+                                                 Camera camera, Primitive aggregate,
+                                                 std::vector<Light> lights,
+                                                 const FileLoc *loc);
+
+    std::string ToString() const;
+
+  private:
+    // PSSMLTIntegrator Constants
+    static constexpr int cameraStreamIndex = 0;
+    static constexpr int lightStreamIndex = 1;
+    static constexpr int connectionStreamIndex = 2;
+    static constexpr int nSampleStreams = 3;
+
+    // PSSMLTIntegrator Private Methods
+    SampledSpectrum L(ScratchBuffer &scratchBuffer, MLTSampler &sampler, int k,
+                      Point2f *pRaster, SampledWavelengths *lambda);
+
+    static Float c(const SampledSpectrum &L, const SampledWavelengths &lambda) {
+        return L.y(lambda);
+    }
+
+    // PSSMLTIntegrator Private Members
+    Camera camera;
+    bool regularize;
+    LightSampler lightSampler;
+    int maxDepth, nBootstrap;
+    int mutationsPerPixel;
+    Float sigma, largeStepProbability;
+    int nChains;
+};
 
 // SPPMIntegrator Definition
 class SPPMIntegrator : public Integrator {
