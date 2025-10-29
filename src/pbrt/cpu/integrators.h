@@ -431,6 +431,8 @@ class MLTIntegrator : public Integrator {
     Float sigma, largeStepProbability;
     int nChains;
 };
+
+struct SplatList;
 class PSSMLTIntegrator : public Integrator {
   public:
     // MLTIntegrator Public Methods
@@ -456,6 +458,10 @@ class PSSMLTIntegrator : public Integrator {
                                                  const FileLoc *loc);
 
     std::string ToString() const;
+    
+    static Float c(const SampledSpectrum &L, const SampledWavelengths &lambda) {
+        return L.y(lambda);
+    }
 
   private:
     // PSSMLTIntegrator Constants
@@ -465,12 +471,9 @@ class PSSMLTIntegrator : public Integrator {
     static constexpr int nSampleStreams = 3;
 
     // PSSMLTIntegrator Private Methods
-    SampledSpectrum L(ScratchBuffer &scratchBuffer, MLTSampler &sampler, int k,
+    SplatList L(ScratchBuffer &scratchBuffer, MLTSampler &sampler, int k,
                       Point2f *pRaster, SampledWavelengths *lambda);
 
-    static Float c(const SampledSpectrum &L, const SampledWavelengths &lambda) {
-        return L.y(lambda);
-    }
 
     // PSSMLTIntegrator Private Members
     Camera camera;
