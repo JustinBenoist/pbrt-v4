@@ -433,7 +433,10 @@ class MLTIntegrator : public Integrator {
 };
 
 struct SplatList;
-class PSSMLTIntegrator : public Integrator {
+
+enum class SamplingTechnique{Unidirectional, Bidirectional};
+
+class PSSMLTIntegrator : public Integrator{
   public:
     // MLTIntegrator Public Methods
     PSSMLTIntegrator(Camera camera, Primitive aggregate, std::vector<Light> lights,
@@ -463,7 +466,7 @@ class PSSMLTIntegrator : public Integrator {
         return L.y(lambda);
     }
 
-  private:
+  protected:
     // PSSMLTIntegrator Constants
     static constexpr int cameraStreamIndex = 0;
     static constexpr int lightStreamIndex = 1;
@@ -471,9 +474,20 @@ class PSSMLTIntegrator : public Integrator {
     static constexpr int nSampleStreams = 3;
 
     // PSSMLTIntegrator Private Methods
-    SplatList L(ScratchBuffer &scratchBuffer, MLTSampler &sampler, int k,
+    SplatList L(ScratchBuffer &scratchBuffer, MLTSampler &sampler,
+                Point2f *pRaster, SampledWavelengths *lambda);
+
+    SplatList LBidirectional(ScratchBuffer &scratchBuffer, MLTSampler &sampler,
                       Point2f *pRaster, SampledWavelengths *lambda);
 
+    SplatList LUnidirectional(ScratchBuffer &scratchBuffer, Sampler sampler,
+                              RayDifferential ray, Point2f *pRaster, 
+                              SampledWavelengths *lambda, VisibleSurface *visibleSurf);
+
+    SampledSpectrum SampleLd(const Interaction &intr, const BSDF *bsdf,
+                            SampledWavelengths &lambda, Sampler sampler,
+                            SampledSpectrum beta,
+                            SampledSpectrum r_p) const;
 
     // PSSMLTIntegrator Private Members
     Camera camera;
@@ -483,6 +497,32 @@ class PSSMLTIntegrator : public Integrator {
     int mutationsPerPixel;
     Float sigma, largeStepProbability;
     int nChains;
+    inline static SamplingTechnique technique;
+};
+
+class SMCMCIntegrator : public PSSMLTIntegrator{
+  public:
+    // MLTIntegrator Public Methods
+    SMCMCIntegrator(Camera camera, Primitive aggregate, std::vector<Light> lights,
+                  int maxDepth, int nBootstrap, int nChains, int mutationsPerPixel,
+                  Float sigma, Float largeStepProbability, bool regularize)
+        : PSSMLTIntegrator(camera, aggregate, lights, maxDepth, nBootstrap, nChains,
+                           mutationsPerPixel, sigma, largeStepProbability, regularize),
+          lightSampler(new PowerLightSampler(lights, Allocator())) {}
+
+    static std::unique_ptr<SMCMCIntegrator> Create(const ParameterDictionary &parameters,
+                                                 Camera camera, Primitive aggregate,
+                                                 std::vector<Light> lights,
+                                                 const FileLoc *loc);
+
+    std::string ToString() const;
+    
+    static Float c(const SampledSpectrum &L, const SampledWavelengths &lambda) {
+        return L.y(lambda);
+    }
+    
+    private:
+        LightSampler lightSampler;
 };
 
 // SPPMIntegrator Definition
