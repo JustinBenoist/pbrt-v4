@@ -3144,16 +3144,16 @@ SplatList PSSMLTIntegrator::LUnidirectional(ScratchBuffer &scratchBuffer, Sample
         // Possibly terminate volumetric path with Russian roulette
         if (!beta)
             break;
-        // SampledSpectrum rrBeta = beta * etaScale / r_u.Average();
-        // Float uRR = sampler.Get1D();
-        // PBRT_DBG("%s\n",
-        //          StringPrintf("etaScale %f -> rrBeta %s", etaScale, rrBeta).c_str());
-        // if (rrBeta.MaxComponentValue() < 1 && depth > 1) {
-        //     Float q = std::max<Float>(0, 1 - rrBeta.MaxComponentValue());
-        //     if (uRR < q)
-        //         break;
-        //     beta /= 1 - q;
-        // }
+        SampledSpectrum rrBeta = beta * etaScale / r_u.Average();
+        Float uRR = sampler.Get1D();
+        PBRT_DBG("%s\n",
+                 StringPrintf("etaScale %f -> rrBeta %s", etaScale, rrBeta).c_str());
+        if (rrBeta.MaxComponentValue() < 1 && depth > 1) {
+            Float q = std::max<Float>(0, 1 - rrBeta.MaxComponentValue());
+            if (uRR < q)
+                break;
+            beta /= 1 - q;
+        }
     }
     return splats;
 }
