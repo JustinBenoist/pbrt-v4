@@ -1,8 +1,9 @@
 Integrator "pssmlt"
     "integer maxdepth" [ 13 ]
     "integer mutationsperpixel" [ 64 ]
-    "integer bootstrapsamples" [ 1000000 ]
+    "integer bootstrapsamples" [ 100000 ]
     "float largestepprobability" [ 0.05 ]
+    "string pathsampling" [ "unidirectional" ]
 Transform [ 1 -0 -0 -0 -0 1 -0 -0 -0 -0 -1 -0 -0 -1 6.8 1  ]
 Sampler "sobol"
     "integer pixelsamples" [ 64 ]
