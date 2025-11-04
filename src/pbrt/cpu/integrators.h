@@ -400,6 +400,8 @@ class MLTIntegrator : public Integrator {
 
     void Render();
 
+    void RenderDirectLights(Film film, const double timeBudget);
+
     static std::unique_ptr<MLTIntegrator> Create(const ParameterDictionary &parameters,
                                                  Camera camera, Primitive aggregate,
                                                  std::vector<Light> lights,
@@ -430,6 +432,7 @@ class MLTIntegrator : public Integrator {
     int mutationsPerPixel;
     Float sigma, largeStepProbability;
     int nChains;
+    inline static bool renderLightSeparately;
 };
 
 struct SplatList;
@@ -466,6 +469,8 @@ class PSSMLTIntegrator : public Integrator{
         return L.y(lambda);
     }
 
+    void RenderDirectLights(Film film, const double timeBudget);
+
   protected:
     // PSSMLTIntegrator Constants
     static constexpr int cameraStreamIndex = 0;
@@ -488,7 +493,7 @@ class PSSMLTIntegrator : public Integrator{
                             SampledWavelengths &lambda, Sampler sampler,
                             SampledSpectrum beta,
                             SampledSpectrum r_p) const;
-
+    
     // PSSMLTIntegrator Private Members
     Camera camera;
     bool regularize;
@@ -498,6 +503,7 @@ class PSSMLTIntegrator : public Integrator{
     Float sigma, largeStepProbability;
     int nChains;
     inline static SamplingTechnique technique;
+    inline static bool renderLightSeparately;
 };
 
 class SMCMCIntegrator : public PSSMLTIntegrator{

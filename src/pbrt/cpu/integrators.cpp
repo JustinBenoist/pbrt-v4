@@ -1486,7 +1486,7 @@ int RandomWalk(const Integrator &integrator, SampledWavelengths &lambda,
 SampledSpectrum ConnectBDPT(const Integrator &integrator, SampledWavelengths &lambda,
                             Vertex *lightVertices, Vertex *cameraVertices, int s, int t,
                             LightSampler lightSampler, Camera camera, Sampler sampler,
-                            pstd::optional<Point2f> *pRaster,
+                            pstd::optional<Point2f> *pRaster, bool ignoreDirectLights,
                             Float *misWeightPtr = nullptr);
 
 Float InfiniteLightDensity(const std::vector<Light> &infiniteLights,
@@ -2279,7 +2279,7 @@ SampledSpectrum BDPTIntegrator::Li(RayDifferential ray, SampledWavelengths &lamb
             Float misWeight = 0.f;
             SampledSpectrum Lpath =
                 ConnectBDPT(*this, lambda, lightVertices, cameraVertices, s, t,
-                            lightSampler, camera, sampler, &pFilmNew, &misWeight);
+                            lightSampler, camera, sampler, &pFilmNew, false, &misWeight);
             PBRT_DBG("%s\n",
                      StringPrintf("Connect bdpt s: %d, t: %d, Lpath: %s, misWeight: %f\n",
                                   s, t, Lpath, misWeight)
@@ -2325,7 +2325,8 @@ SampledSpectrum BDPTIntegrator::Li(RayDifferential ray, SampledWavelengths &lamb
 SampledSpectrum ConnectBDPT(const Integrator &integrator, SampledWavelengths &lambda,
                             Vertex *lightVertices, Vertex *cameraVertices, int s, int t,
                             LightSampler lightSampler, Camera camera, Sampler sampler,
-                            pstd::optional<Point2f> *pRaster, Float *misWeightPtr) {
+                            pstd::optional<Point2f> *pRaster, bool ignoreDirectLights,
+                            Float *misWeightPtr) {
     SampledSpectrum L(0.f);
     // Ignore invalid connections related to infinite area lights
     if (t > 1 && s != 0 && cameraVertices[t - 1].type == VertexType::Light)
@@ -2336,7 +2337,7 @@ SampledSpectrum ConnectBDPT(const Integrator &integrator, SampledWavelengths &la
     if (s == 0) {
         // Interpret the camera subpath as a complete path
         const Vertex &pt = cameraVertices[t - 1];
-        if (pt.IsLight())
+        if (pt.IsLight() && !ignoreDirectLights)
             L = pt.Le(integrator.infiniteLights, cameraVertices[t - 2], lambda) * pt.beta;
         DCHECK(!L.HasNaNs());
 
@@ -2536,11 +2537,53 @@ SampledSpectrum MLTIntegrator::L(ScratchBuffer &scratchBuffer, MLTSampler &sampl
     sampler.StartStream(connectionStreamIndex);
     pstd::optional<Point2f> pRasterNew;
     SampledSpectrum L = ConnectBDPT(*this, *lambda, lightVertices, cameraVertices, s, t,
-                                    lightSampler, camera, &sampler, &pRasterNew) *
-                        nStrategies;
+                                    lightSampler, camera, &sampler, &pRasterNew,
+                                    renderLightSeparately) * nStrategies;
     if (pRasterNew)
         *pRaster = *pRasterNew;
     return L;
+}
+
+void MLTIntegrator::RenderDirectLights(Film film, const double timeBudget) {
+    const Bounds2i pixelBounds = camera.GetFilm().PixelBounds();
+    // Render directly visible emitters (simple raster pass)
+    ProgressReporter progressVis(1, "Adding direct visible lights", false);
+    Timer timer;
+    int i = 0;
+    while (timer.ElapsedSeconds() < timeBudget && i < 1000){
+        ParallelFor2D(pixelBounds, [&](Point2i p) {
+            RNG rng(i * pixelBounds.Area() + p.x * pixelBounds.pMax.x + p.y);
+            Bounds2f sampleBounds = camera.GetFilm().SampleBounds();
+            Point2f pRaster = sampleBounds.Lerp({((float)p.x) / (float)pixelBounds.pMax.x,
+                                                ((float)p.y) / (float)pixelBounds.pMax.y});
+            pRaster = pRaster + Point2f{rng.Uniform<Float>(), rng.Uniform<Float>()};
+
+            SampledWavelengths lambda = camera.GetFilm().SampleWavelengths(rng.Uniform<Float>());
+            CameraSample cameraSample;
+            cameraSample.pFilm = pRaster;
+            cameraSample.time = rng.Uniform<Float>();
+            cameraSample.pLens = {rng.Uniform<Float>(), rng.Uniform<Float>()};
+            pstd::optional<CameraRayDifferential> crd = 
+                    camera.GenerateRayDifferential(cameraSample, lambda);
+            // Intersect scene once
+            pstd::optional<ShapeIntersection> si = Intersect(crd->ray);
+            if (si && si->intr.Le(-crd->ray.d, lambda)) {
+                SampledSpectrum Le = si->intr.Le(-crd->ray.d, lambda);
+                film.AddSample(p, Le, lambda, nullptr, 1.0);
+            } else if (!si) {
+                // environment light
+                for (auto &light : infiniteLights) {
+                    SampledSpectrum Le = light.Le(crd->ray, lambda);
+                    film.AddSample(p, Le, lambda, nullptr, 1.0);
+                }
+            } else if (si && !si->intr.Le(-crd->ray.d, lambda)) {
+                film.AddSample(p, SampledSpectrum(0.f), lambda, nullptr, 1.0);
+            }
+        });
+        i++;
+    }
+    
+    progressVis.Done();
 }
 
 void MLTIntegrator::Render() {
@@ -2710,6 +2753,10 @@ void MLTIntegrator::Render() {
 
     progressRender.Done();
 
+    if (renderLightSeparately){
+        RenderDirectLights(film, log(1 + timer.ElapsedSeconds()));
+    }
+
     // Store final image computed with MLT
     ImageMetadata metadata;
     metadata.renderTimeSeconds = timer.ElapsedSeconds();
@@ -2740,6 +2787,7 @@ std::unique_ptr<MLTIntegrator> MLTIntegrator::Create(
         mutationsPerPixel = *Options->pixelSamples;
     Float largeStepProbability = parameters.GetOneFloat("largestepprobability", 0.3f);
     Float sigma = parameters.GetOneFloat("sigma", .01f);
+    renderLightSeparately = parameters.GetOneBool("renderLightSeparately", false);
     if (Options->quickRender) {
         mutationsPerPixel = std::max(1, mutationsPerPixel / 16);
         nBootstrap = std::max(1, nBootstrap / 16);
@@ -2969,7 +3017,9 @@ SplatList PSSMLTIntegrator::LUnidirectional(ScratchBuffer &scratchBuffer, Sample
             // Accumulate contributions from infinite light sources
             for (const auto &light : infiniteLights) {
                 if (SampledSpectrum Le = light.Le(ray, *lambda); Le) {
-                    if (depth == 0 || specularBounce)
+                    if (depth == 0 && renderLightSeparately)
+                        splats.add({SampledSpectrum(0.f), *pRaster, *lambda});
+                    else if (depth == 0 && !renderLightSeparately || specularBounce)
                         splats.add({beta * Le / r_u.Average(), *pRaster, *lambda});
                     else {
                         // Add infinite light contribution using both PDFs with MIS
@@ -2986,7 +3036,9 @@ SplatList PSSMLTIntegrator::LUnidirectional(ScratchBuffer &scratchBuffer, Sample
         SurfaceInteraction &isect = si->intr;
         if (SampledSpectrum Le = isect.Le(-ray.d, *lambda); Le) {
             // Add contribution of emission from intersected surface
-            if (depth == 0 || specularBounce)
+            if (depth == 0 && renderLightSeparately)
+                splats.add({SampledSpectrum(0.f), *pRaster, *lambda});
+            else if (depth == 0 && !renderLightSeparately || specularBounce)
                 splats.add({beta * Le / r_u.Average(), *pRaster, *lambda});
             else {
                 // Add surface light contribution using both PDFs with MIS
@@ -3156,6 +3208,48 @@ SplatList PSSMLTIntegrator::LUnidirectional(ScratchBuffer &scratchBuffer, Sample
         }
     }
     return splats;
+}
+
+void PSSMLTIntegrator::RenderDirectLights(Film film, const double timeBudget) {
+    const Bounds2i pixelBounds = camera.GetFilm().PixelBounds();
+    // Render directly visible emitters (simple raster pass)
+    ProgressReporter progressVis(1, "Adding direct visible lights", false);
+    Timer timer;
+    int i = 0;
+    while (timer.ElapsedSeconds() < timeBudget && i < 1000){
+        ParallelFor2D(pixelBounds, [&](Point2i p) {
+            RNG rng(i * pixelBounds.Area() + p.x * pixelBounds.pMax.x + p.y);
+            Bounds2f sampleBounds = camera.GetFilm().SampleBounds();
+            Point2f pRaster = sampleBounds.Lerp({((float)p.x) / (float)pixelBounds.pMax.x,
+                                                ((float)p.y) / (float)pixelBounds.pMax.y});
+            pRaster = pRaster + Point2f{rng.Uniform<Float>(), rng.Uniform<Float>()};
+
+            SampledWavelengths lambda = camera.GetFilm().SampleWavelengths(rng.Uniform<Float>());
+            CameraSample cameraSample;
+            cameraSample.pFilm = pRaster;
+            cameraSample.time = rng.Uniform<Float>();
+            cameraSample.pLens = {rng.Uniform<Float>(), rng.Uniform<Float>()};
+            pstd::optional<CameraRayDifferential> crd = 
+                    camera.GenerateRayDifferential(cameraSample, lambda);
+            // Intersect scene once
+            pstd::optional<ShapeIntersection> si = Intersect(crd->ray);
+            if (si && si->intr.Le(-crd->ray.d, lambda)) {
+                SampledSpectrum Le = si->intr.Le(-crd->ray.d, lambda);
+                film.AddSample(p, Le, lambda, nullptr, 1.0);
+            } else if (!si) {
+                // environment light
+                for (auto &light : infiniteLights) {
+                    SampledSpectrum Le = light.Le(crd->ray, lambda);
+                    film.AddSample(p, Le, lambda, nullptr, 1.0);
+                }
+            } else if (si && !si->intr.Le(-crd->ray.d, lambda)) {
+                film.AddSample(p, SampledSpectrum(0.f), lambda, nullptr, 1.0);
+            }
+        });
+        i++;
+    }
+    
+    progressVis.Done();
 }
 
 SampledSpectrum PSSMLTIntegrator::SampleLd(const Interaction &intr, const BSDF *bsdf,
@@ -3345,7 +3439,8 @@ SplatList PSSMLTIntegrator::LBidirectional(ScratchBuffer &scratchBuffer, MLTSamp
             //                                      s1D, s2D);
             SampledSpectrum Lpath = ConnectBDPT(*this, *lambda, lightVertices,
                                                 cameraVertices, s, t, lightSampler, 
-                                                camera, &sampler, &pRasterNew);
+                                                camera, &sampler, &pRasterNew,
+                                                renderLightSeparately);
             if (t != 1){
                 splats.add({Lpath, *pRaster, *lambda});
             }
@@ -3536,6 +3631,10 @@ void PSSMLTIntegrator::Render() {
     });
 
     progressRender.Done();
+    
+    if (renderLightSeparately){
+        RenderDirectLights(film, log(1 + timer.ElapsedSeconds()));
+    }
 
     // Store final image computed with MLT
     ImageMetadata metadata;
@@ -3606,6 +3705,7 @@ std::unique_ptr<PSSMLTIntegrator> PSSMLTIntegrator::Create(
     Float largeStepProbability = parameters.GetOneFloat("largestepprobability", 0.3f);
     Float sigma = parameters.GetOneFloat("sigma", .01f);
     std::string techniqueStr = parameters.GetOneString("pathsampling", "unidirectional");
+    renderLightSeparately = parameters.GetOneBool("renderLightSeparately", true);
     if (techniqueStr == "unidirectional"){
         technique = SamplingTechnique::Unidirectional;
     }
