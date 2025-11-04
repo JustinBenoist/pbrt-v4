@@ -4,11 +4,9 @@ Integrator "pssmlt"
     "integer mutationsperpixel" [ 128 ]
     "string pathsampling" [ "unidirectional" ]
 Transform [ 0.137285 -0.0319925 -0.990015 -0 -0 0.999478 -0.0322983 -0 -0.990531 -0.00443405 -0.137212 -0 -2.84124 -1.49616 3.74927 1  ]
-Sampler "sobol"
+Sampler "independent"
     "integer pixelsamples" [ 64 ]
-PixelFilter "triangle"
-    "float xradius" [ 1 ]
-    "float yradius" [ 1 ]
+PixelFilter "box"
 Film "rgb"
     "string filename" [ "veach-ajar.png" ]
     "integer yresolution" [ 720 ]

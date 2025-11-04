@@ -3,7 +3,7 @@ Integrator "pssmlt"
     "float largestepprobability" [ 0.05 ]
     "integer mutationsperpixel" [ 64 ]
     "string pathsampling" [ "unidirectional" ]
-Sampler "halton"
+Sampler "independent"
     "integer pixelsamples" [ 1024 ]
 PixelFilter "gaussian"
 Film "rgb" "float iso" 400

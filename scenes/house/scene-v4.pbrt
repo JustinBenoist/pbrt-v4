@@ -2,12 +2,12 @@ Integrator "pssmlt"
     "integer maxdepth" [ 13 ]
     "integer mutationsperpixel" [ 128 ]
     "float largestepprobability" [ 0.05 ]
+    "string pathsampling" [ "unidirectional" ]
+    "bool renderLightSeparately" [ true ]
 Transform [ 0.738427 -0.102514 0.666496 -0 -0 0.988377 0.152022 -0 0.674334 0.112257 -0.729844 -0 6.00497 -6.83966 48.5088 1  ]
 Sampler "independent"
     "integer pixelsamples" [ 64 ]
-PixelFilter "triangle"
-    "float xradius" [ 1 ]
-    "float yradius" [ 1 ]
+PixelFilter "box"
 Film "rgb"
     "string filename" [ "house.png" ]
     "integer yresolution" [ 720 ]

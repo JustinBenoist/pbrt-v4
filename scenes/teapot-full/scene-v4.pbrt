@@ -4,11 +4,9 @@ Integrator "pssmlt"
     "integer mutationsperpixel" [ 64 ]
     "string pathsampling" [ "unidirectional" ]
 Transform [ -0.00561587 -0.488405 -0.872599 -0 -0 0.872613 -0.488413 -0 -0.999984 0.00273835 0.00489243 -0 -0.0423531 -2.39555 27.8941 1  ]
-Sampler "sobol"
+Sampler "independent"
     "integer pixelsamples" [ 64 ]
-PixelFilter "triangle"
-    "float xradius" [ 1 ]
-    "float yradius" [ 1 ]
+PixelFilter "box"
 Film "rgb"
     "string filename" [ "teapot-full.png" ]
     "integer yresolution" [ 720 ]

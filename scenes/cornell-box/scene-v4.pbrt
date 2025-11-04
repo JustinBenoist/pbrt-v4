@@ -1,15 +1,14 @@
-Integrator "pssmlt"
+Integrator "mlt"
     "integer maxdepth" [ 13 ]
-    "integer mutationsperpixel" [ 64 ]
+    "integer mutationsperpixel" [ 256 ]
     "integer bootstrapsamples" [ 100000 ]
     "float largestepprobability" [ 0.05 ]
-    "string pathsampling" [ "unidirectional" ]
+    #"string pathsampling" [ "bidirectional" ]
+    "bool renderLightSeparately" [ true ]
 Transform [ 1 -0 -0 -0 -0 1 -0 -0 -0 -0 -1 -0 -0 -1 6.8 1  ]
-Sampler "sobol"
+Sampler "independent"
     "integer pixelsamples" [ 64 ]
-PixelFilter "triangle"
-    "float xradius" [ 1 ]
-    "float yradius" [ 1 ]
+PixelFilter "box"
 Film "rgb"
     "string filename" [ "cornell-box.png" ]
     "integer yresolution" [ 1024 ]
