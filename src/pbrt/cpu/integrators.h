@@ -12,6 +12,8 @@
 #include <pbrt/bsdf.h>
 #include <pbrt/cameras.h>
 #include <pbrt/cpu/primitive.h>
+#include <pbrt/cpu/tile.h>
+#include <pbrt/cpu/solvers.h>
 #include <pbrt/film.h>
 #include <pbrt/interaction.h>
 #include <pbrt/lights.h>
@@ -444,7 +446,8 @@ class PSSMLTIntegrator : public Integrator{
     // MLTIntegrator Public Methods
     PSSMLTIntegrator(Camera camera, Primitive aggregate, std::vector<Light> lights,
                   int maxDepth, int nBootstrap, int nChains, int mutationsPerPixel,
-                  Float sigma, Float largeStepProbability, bool regularize)
+                  Float sigma, Float largeStepProbability, bool regularize, 
+                  const RGBColorSpace *colorSpace)
         : Integrator(aggregate, lights),
           lightSampler(new PowerLightSampler(lights, Allocator())),
           camera(camera),
@@ -454,11 +457,13 @@ class PSSMLTIntegrator : public Integrator{
           mutationsPerPixel(mutationsPerPixel),
           sigma(sigma),
           largeStepProbability(largeStepProbability),
-          regularize(regularize) {}
+          regularize(regularize),
+          colorSpace(colorSpace) {}
 
     void Render();
 
     static std::unique_ptr<PSSMLTIntegrator> Create(const ParameterDictionary &parameters,
+                                                 const RGBColorSpace *colorSpace,
                                                  Camera camera, Primitive aggregate,
                                                  std::vector<Light> lights,
                                                  const FileLoc *loc);
@@ -504,31 +509,61 @@ class PSSMLTIntegrator : public Integrator{
     int nChains;
     inline static SamplingTechnique technique;
     inline static bool renderLightSeparately;
+    const RGBColorSpace *colorSpace;
 };
 
-class SMCMCIntegrator : public PSSMLTIntegrator{
+enum EInitAlgo {
+    EInitBruteForce,
+    EInitMCMC,
+    EInitNaive,
+};
+
+class SPSSMLTIntegrator : public PSSMLTIntegrator{
   public:
     // MLTIntegrator Public Methods
-    SMCMCIntegrator(Camera camera, Primitive aggregate, std::vector<Light> lights,
+    SPSSMLTIntegrator(Camera camera, Primitive aggregate, std::vector<Light> lights,
                   int maxDepth, int nBootstrap, int nChains, int mutationsPerPixel,
-                  Float sigma, Float largeStepProbability, bool regularize)
+                  Float sigma, Float largeStepProbability, bool regularize, 
+                  const RGBColorSpace *colorSpace)
         : PSSMLTIntegrator(camera, aggregate, lights, maxDepth, nBootstrap, nChains,
-                           mutationsPerPixel, sigma, largeStepProbability, regularize),
+                           mutationsPerPixel, sigma, largeStepProbability, regularize,
+                           colorSpace),
           lightSampler(new PowerLightSampler(lights, Allocator())) {}
 
-    static std::unique_ptr<SMCMCIntegrator> Create(const ParameterDictionary &parameters,
+    static std::unique_ptr<SPSSMLTIntegrator> Create(const ParameterDictionary &parameters,
+                                                 const RGBColorSpace *colorSpace,
                                                  Camera camera, Primitive aggregate,
                                                  std::vector<Light> lights,
                                                  const FileLoc *loc);
+    
+    void InitTiles();
+    void InitializeChains(int iteration);
+    void Mutate(ScratchBuffer &scratchBuffer, MCMCTile* tile, const bool shiftMapping);
+    void IndependentChainExploration(int nbSamples);
+    void ScaleGlobally(int pixelCount, SampledSpectrum *accum);
+    Float ComputeAverageLuminance(int sampleCount);
 
-    std::string ToString() const;
+    std::string ToString() const override;
+
+    void Render() override;
+
+    std::vector<SampledSpectrum> LTile(ScratchBuffer &scratchBuffer, MLTSampler &sampler,
+                                       const Point2i& pPixel, SampledWavelengths *lambda,
+                                       const bool shiftMapping);
     
     static Float c(const SampledSpectrum &L, const SampledWavelengths &lambda) {
         return L.y(lambda);
+        // return 1.f;
     }
     
     private:
         LightSampler lightSampler;
+        bool useShiftMapping = true;
+        std::vector<MCMCTile*> tiles;
+        // EInitAlgo algo = EInitNaive;
+        EInitAlgo algo = EInitBruteForce;
+        const int SPP_INIT = 32;
+        Float meanLuminance = 0.f;
 };
 
 // SPPMIntegrator Definition

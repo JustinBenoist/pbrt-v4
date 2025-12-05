@@ -677,6 +677,21 @@ class MLTSampler {
     PBRT_CPU_GPU
     void Accept();
 
+    PBRT_CPU_GPU
+    void SetLargeStep(const bool b){
+        largeStep = b;
+    }
+
+    PBRT_CPU_GPU
+    bool GetLargeStep() const {
+        return largeStep;
+    }
+
+    PBRT_CPU_GPU
+    Float GetLargeStepProbability() const {
+        return largeStepProbability;
+    }
+
     std::string DumpState() const;
 
     std::string ToString() const {

@@ -1,9 +1,9 @@
-Integrator "mlt"
-    "integer maxdepth" [ 13 ]
+Integrator "spssmlt"
+    "integer maxdepth" [ 1 ]
     "integer mutationsperpixel" [ 256 ]
     "integer bootstrapsamples" [ 100000 ]
     "float largestepprobability" [ 0.05 ]
-    #"string pathsampling" [ "bidirectional" ]
+    #"string pathsampling" [ "unidirectional" ]
     "bool renderLightSeparately" [ true ]
 Transform [ 1 -0 -0 -0 -0 1 -0 -0 -0 -0 -1 -0 -0 -1 6.8 1  ]
 Sampler "independent"

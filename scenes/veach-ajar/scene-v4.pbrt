@@ -1,4 +1,4 @@
-Integrator "pssmlt"
+Integrator "spssmlt"
     "integer maxdepth" [ 13 ]
     "float largestepprobability" [ 0.05 ]
     "integer mutationsperpixel" [ 128 ]

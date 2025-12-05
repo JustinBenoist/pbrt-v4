@@ -3213,7 +3213,7 @@ SplatList PSSMLTIntegrator::LUnidirectional(ScratchBuffer &scratchBuffer, Sample
 void PSSMLTIntegrator::RenderDirectLights(Film film, const double timeBudget) {
     const Bounds2i pixelBounds = camera.GetFilm().PixelBounds();
     // Render directly visible emitters (simple raster pass)
-    ProgressReporter progressVis(1, "Adding direct visible lights", false);
+    ProgressReporter progressVis(1, "Adding direct visible lights", Options->quiet);
     Timer timer;
     int i = 0;
     while (timer.ElapsedSeconds() < timeBudget && i < 1000){
@@ -3458,6 +3458,44 @@ SplatList PSSMLTIntegrator::LBidirectional(ScratchBuffer &scratchBuffer, MLTSamp
     return splats;
 }
 
+SplatList PSSMLTIntegrator::L(ScratchBuffer &scratchBuffer, MLTSampler &sampler,
+                              Point2f *pRaster, SampledWavelengths *lambda) {
+    if (technique == SamplingTechnique::Unidirectional) {
+        sampler.StartStream(cameraStreamIndex);
+        // Sample wavelengths for MLT path
+        if (Options->disableWavelengthJitter)
+            *lambda = camera.GetFilm().SampleWavelengths(0.5);
+        else
+            *lambda = camera.GetFilm().SampleWavelengths(sampler.Get1D());
+
+        // Compute camera sample for MLT camera path
+        Bounds2f sampleBounds = camera.GetFilm().SampleBounds();
+        *pRaster = sampleBounds.Lerp(sampler.GetPixel2D());
+        CameraSample cameraSample;
+        cameraSample.pFilm = *pRaster;
+        cameraSample.time = sampler.Get1D();
+        cameraSample.pLens = sampler.Get2D();
+
+        // Generate camera ray for MLT camera path
+        pstd::optional<CameraRayDifferential> crd =
+            camera.GenerateRayDifferential(cameraSample, *lambda);
+        // if (!crd || !crd->weight)
+        //     return SplatList(0);
+        Float rayDiffScale =
+            std::max<Float>(.125, 1 / std::sqrt((Float)sampler.SamplesPerPixel()));
+        crd->ray.ScaleDifferentials(rayDiffScale);
+        VisibleSurface visibleSurface;
+        bool initializeVisibleSurface = camera.GetFilm().UsesVisibleSurface();
+
+        return LUnidirectional(scratchBuffer, &sampler, crd->ray, pRaster, lambda,
+                               initializeVisibleSurface ? &visibleSurface : nullptr);
+    }
+    else if (technique == SamplingTechnique::Bidirectional) {
+        return LBidirectional(scratchBuffer, sampler, pRaster, lambda);
+    }
+    ErrorExit("Sampling technique does not exist");
+}
+
 void PSSMLTIntegrator::Render() {
     // Handle statistics and debugstart for PSSMLTIntegrator
     if (Options->recordPixelStatistics)
@@ -3644,44 +3682,6 @@ void PSSMLTIntegrator::Render() {
     DisconnectFromDisplayServer();
 }
 
-SplatList PSSMLTIntegrator::L(ScratchBuffer &scratchBuffer, MLTSampler &sampler,
-                              Point2f *pRaster, SampledWavelengths *lambda) {
-    if (technique == SamplingTechnique::Unidirectional) {
-        sampler.StartStream(cameraStreamIndex);
-        // Sample wavelengths for MLT path
-        if (Options->disableWavelengthJitter)
-            *lambda = camera.GetFilm().SampleWavelengths(0.5);
-        else
-            *lambda = camera.GetFilm().SampleWavelengths(sampler.Get1D());
-
-        // Compute camera sample for MLT camera path
-        Bounds2f sampleBounds = camera.GetFilm().SampleBounds();
-        *pRaster = sampleBounds.Lerp(sampler.GetPixel2D());
-        CameraSample cameraSample;
-        cameraSample.pFilm = *pRaster;
-        cameraSample.time = sampler.Get1D();
-        cameraSample.pLens = sampler.Get2D();
-
-        // Generate camera ray for MLT camera path
-        pstd::optional<CameraRayDifferential> crd =
-            camera.GenerateRayDifferential(cameraSample, *lambda);
-        // if (!crd || !crd->weight)
-        //     return SplatList(0);
-        Float rayDiffScale =
-            std::max<Float>(.125, 1 / std::sqrt((Float)sampler.SamplesPerPixel()));
-        crd->ray.ScaleDifferentials(rayDiffScale);
-        VisibleSurface visibleSurface;
-        bool initializeVisibleSurface = camera.GetFilm().UsesVisibleSurface();
-
-        return LUnidirectional(scratchBuffer, &sampler, crd->ray, pRaster, lambda,
-                               initializeVisibleSurface ? &visibleSurface : nullptr);
-    }
-    else if (technique == SamplingTechnique::Bidirectional) {
-        return LBidirectional(scratchBuffer, sampler, pRaster, lambda);
-    }
-    ErrorExit("Sampling technique does not exist");
-}
-
 std::string PSSMLTIntegrator::ToString() const {
     return StringPrintf("[ PSSMLTIntegrator camera: %s maxDepth: %d nBootstrap: %d "
                         "nChains: %d mutationsPerPixel: %d sigma: %f "
@@ -3691,8 +3691,8 @@ std::string PSSMLTIntegrator::ToString() const {
 }
 
 std::unique_ptr<PSSMLTIntegrator> PSSMLTIntegrator::Create(
-    const ParameterDictionary &parameters, Camera camera, Primitive aggregate,
-    std::vector<Light> lights, const FileLoc *loc) {
+    const ParameterDictionary &parameters, const RGBColorSpace *colorSpace, 
+    Camera camera, Primitive aggregate, std::vector<Light> lights, const FileLoc *loc) {
     if (!camera.Is<PerspectiveCamera>())
         ErrorExit("Only the \"perspective\" camera is currently supported with the "
                   "\"pssmlt\" integrator.");
@@ -3722,21 +3722,496 @@ std::unique_ptr<PSSMLTIntegrator> PSSMLTIntegrator::Create(
     bool regularize = parameters.GetOneBool("regularize", false);
     return std::make_unique<PSSMLTIntegrator>(camera, aggregate, lights, maxDepth,
                                            nBootstrap, nChains, mutationsPerPixel, sigma,
-                                           largeStepProbability, regularize);
+                                           largeStepProbability, regularize, colorSpace);
 }
 
+Float SPSSMLTIntegrator::ComputeAverageLuminance(int sampleCount) {
+    ThreadLocal<ScratchBuffer> threadScratchBuffers([]() { return ScratchBuffer(); });
+    ProgressReporter progress(sampleCount, "Computing average luminance", Options->quiet);
+    Float mean = 0.f, variance = 0.f;
+    ParallelFor(0, sampleCount, [&](int i) {
+        ScratchBuffer &buf = threadScratchBuffers.Get();
+        // Generate _i_th bootstrap sample
+        MLTSampler sampler(mutationsPerPixel, i, sigma,
+                            largeStepProbability, nSampleStreams);
+        // Evaluate path radiance using _sampler_ and update _bootstrapWeights_
+        Point2f pRaster;
+        SampledWavelengths lambda;
+        SplatList bootstrapSplats = L(buf, sampler, &pRaster, &lambda);
+        Float delta = bootstrapSplats.cFromSplats() - mean;
+        mean += delta / (Float) (i+1);
+        variance += delta * delta;
+        buf.Reset();
+        progress.Update(1);
+    });
+    progress.Done();
+    return mean;
+}
 
-std::string SMCMCIntegrator::ToString() const {
-    return StringPrintf("[ SMCMCIntegrator camera: %s maxDepth: %d nBootstrap: %d "
+void SPSSMLTIntegrator::ScaleGlobally(int pixelCount, SampledSpectrum *accum) {
+    Float avgLuminance = 0.f;
+    ParallelFor(0, pixelCount, [&](int i) {
+        MCMCTile* tile = tiles[i];
+        Float currLum = c(accum[i], tile->lambdaCurr); // TODO: Needs to be changed for spectral
+        avgLuminance += currLum;
+    });
+
+    avgLuminance /= (Float)pixelCount;
+    Float luminanceFactor = meanLuminance / avgLuminance;
+
+    ParallelFor(0, pixelCount, [&](int i) {
+        accum[i] *= luminanceFactor;
+    });
+}
+
+void SPSSMLTIntegrator::InitTiles() {
+    tiles.resize(camera.GetFilm().PixelBounds().Area());
+    Bounds2i pb = camera.GetFilm().PixelBounds();
+    int width = pb.pMax.x - pb.pMin.x;
+    ParallelFor2D(camera.GetFilm().PixelBounds(), [&](Point2i pPixel) {
+        int px = pPixel.x - pb.pMin.x;
+        int py = pPixel.y - pb.pMin.y;
+        int i = py * width + px;
+        MLTSampler* sampler = new MLTSampler(mutationsPerPixel, i, sigma, 
+                                             largeStepProbability, nSampleStreams);
+        MCMCTile* tile = new MCMCTile(pPixel, sampler);
+        tiles[i] = tile;
+    });
+}
+
+void SPSSMLTIntegrator::InitializeChains(int iteration) {
+    ThreadLocal<ScratchBuffer> threadScratchBuffers([]() { return ScratchBuffer(); });
+    Film film = camera.GetFilm();
+    if (algo == EInitNaive) {
+        ProgressReporter progress(film.PixelBounds().Area(), "Initializing chains",
+                                  Options->quiet);
+        Bounds2i pb = camera.GetFilm().PixelBounds();
+        int width = pb.pMax.x - pb.pMin.x;
+        ParallelFor2D(film.PixelBounds(), [&](Point2i pPixel) {
+            ScratchBuffer &scratchBuffer = threadScratchBuffers.Get();
+            int px = pPixel.x - pb.pMin.x;
+            int py = pPixel.y - pb.pMin.y;
+            int i = py * width + px;
+            RNG rng(i);
+            MCMCTile* tile = tiles[i];
+            // std::cout << tiles.size() << " " << film.PixelBounds().Area() << "\n";
+            MLTSampler* sampler = tile->sampler;
+            SampledWavelengths lambda;
+            
+            sampler->SetLargeStep(true);
+            int nbTry = 0;
+            while (nbTry < SPP_INIT) {
+                if (nbTry != 0)
+                    sampler->StartIteration();
+                tile->proposed = LTile(scratchBuffer, *sampler, tile->pixel(0), &lambda, 
+                                       useShiftMapping);
+                tile->impProp = std::accumulate(
+                    tile->proposed.begin(), tile->proposed.begin() + TILE_SIZE, 0.f,
+                    [lambda](Float acc, const SampledSpectrum &s) { 
+                        return acc + c(s, lambda); 
+                });
+                tile->lambdaProp = lambda;
+                tile->AccumulateNorm(tile->impProp, tile->proposed);
+                
+                // Randomly accept this proposed path
+                if (tile->impProp != 0.0) {
+                    bool acc = [&]() -> bool {
+                        if (tile->impCurr == 0)
+                            return true;
+                        else
+                            return std::min(1.f, tile->impProp / tile->impCurr) > rng.Uniform<Float>();
+                    }();
+
+                    if (acc) {
+                        sampler->Accept();
+                        tile->impCurr = tile->impProp;
+                        tile->current = tile->proposed;
+                        tile->lambdaCurr = tile->lambdaProp;
+                    }
+                    else {
+                        sampler->Reject();
+                    }
+                }
+                else {
+                    sampler->Reject();
+                }
+                nbTry++;
+            }
+            scratchBuffer.Reset();
+            progress.Update();
+        });
+        progress.Done();
+    }
+    else if (algo == EInitBruteForce) {
+        ProgressReporter progress(film.PixelBounds().Area(), "Initializing chains",
+                                  Options->quiet);
+        Bounds2i pb = camera.GetFilm().PixelBounds();
+        int width = pb.pMax.x - pb.pMin.x;
+        ParallelFor2D(film.PixelBounds(), [&](Point2i pPixel) {
+            ScratchBuffer &scratchBuffer = threadScratchBuffers.Get();
+            int px = pPixel.x - pb.pMin.x;
+            int py = pPixel.y - pb.pMin.y;
+            int i = py * width + px;
+            RNG rng(i);
+            MCMCTile* tile = tiles[i];
+            MLTSampler* sampler = tile->sampler;
+            SampledWavelengths lambda;
+            
+            sampler->SetLargeStep(true);
+            int nbTry = 0;
+            while (tile->impCurr == 0.f && nbTry < SPP_INIT) {
+                tile->current = LTile(scratchBuffer, *sampler, tile->pixel(0), &lambda, 
+                                       useShiftMapping);
+                tile->impCurr = std::accumulate(
+                    tile->current.begin(), tile->current.begin() + TILE_SIZE, 0.f,
+                    [lambda](Float acc, const SampledSpectrum &s) { 
+                        return acc + c(s, lambda); 
+                });
+                tile->AccumulateNorm(tile->impCurr, tile->current);
+                sampler->Accept();
+                nbTry++;
+            }
+            scratchBuffer.Reset();
+            progress.Update();
+        });
+        progress.Done();
+    }
+}
+        
+std::vector<SampledSpectrum> SPSSMLTIntegrator::LTile(ScratchBuffer &scratchBuffer, 
+                                                    MLTSampler &sampler, const Point2i &pPixel, 
+                                                    SampledWavelengths *lambda,
+                                                    const bool shiftMapping) {
+    sampler.StartStream(cameraStreamIndex);
+    Point2i mainPixel = pPixel;
+    Point2f mainPixelRand = sampler.Get2D();
+    Bounds2i imgSize = camera.GetFilm().PixelBounds();
+    if (mainPixel.x == -1 && mainPixel.y == -1) {
+        // This case is for sampling the image coordinate with the global chain
+        mainPixel = Point2i(imgSize.pMax.x * mainPixelRand.x, imgSize.pMax.y * mainPixelRand.y);
+        // *pPixel = mainPixel;
+    }
+    std::vector<SampledSpectrum> res(TILE_SIZE);
+
+    // Sample wavelengths for MLT path
+    if (Options->disableWavelengthJitter)
+        *lambda = camera.GetFilm().SampleWavelengths(0.5);
+    else
+        *lambda = camera.GetFilm().SampleWavelengths(sampler.Get1D());
+    
+    // GetCamera sample -> 5 random numbers
+    CameraSample cs = GetCameraSample(sampler, pPixel, camera.GetFilm().GetFilter());
+    Bounds2f sampleBounds = camera.GetFilm().SampleBounds();
+    const Point2f sizePixel = 
+            {1.f / sampleBounds.pMax.x, 1.f / sampleBounds.pMax.y };
+    Point2f pRaster = cs.pFilm;
+
+    // Number of random number drawn using the sampler
+    const int OFFSET_SAMPLER = Options->disableWavelengthJitter ? 7 : 8; 
+    
+    // Generate camera ray for MLT camera path
+    pstd::optional<CameraRayDifferential> crd = camera.GenerateRayDifferential(cs, *lambda);
+    // if (!crd || !crd->weight)
+    //     return SplatList(0);
+    Float rayDiffScale = 
+            std::max<Float>(.125, 1 / std::sqrt((Float)sampler.SamplesPerPixel()));
+    crd->ray.ScaleDifferentials(rayDiffScale);
+    VisibleSurface visibleSurface;
+    bool initializeVisibleSurface = camera.GetFilm().UsesVisibleSurface();
+
+    if (!shiftMapping) {
+        int randPixIndex = std::floor(sampler.Get1D() * TILE_SIZE);
+        for (int i = 0; i < TILE_SIZE; i++)
+            res[i] = SampledSpectrum(0.f);
+        Point2f newPix = pRaster + Point2f((float)offsets[randPixIndex].x,
+                                           (float)offsets[randPixIndex].y);
+        const SplatList splats = LUnidirectional(scratchBuffer, &sampler, crd->ray, &newPix,
+                                                 lambda, 
+                                                 initializeVisibleSurface ? &visibleSurface : nullptr);
+        res[randPixIndex] = (float)TILE_SIZE * splats.accumulateL();
+    }
+    else {
+        for (int i = 0; i < TILE_SIZE; i++) {
+            Point2f newPix = pRaster + Point2f((float)offsets[i].x,
+                                               (float)offsets[i].y);
+            cs.pFilm = newPix;
+            crd = camera.GenerateRayDifferential(cs, *lambda);
+            Float rayDiffScale = 
+                    std::max<Float>(.125, 1 / std::sqrt((Float)sampler.SamplesPerPixel()));
+            crd->ray.ScaleDifferentials(rayDiffScale);
+            const SplatList splats = LUnidirectional(scratchBuffer, &sampler, crd->ray, &newPix,
+                                                     lambda, 
+                                                     initializeVisibleSurface ? &visibleSurface : nullptr);
+            res[i] = splats.accumulateL();
+            if (i < TILE_SIZE - 1){
+                // Reset the sampler for replay
+                sampler.StartStream(cameraStreamIndex);
+                // Draw the number of samples before the loop to reset at the same state
+                for (int k = 0; k < OFFSET_SAMPLER; k++)
+                    sampler.Get1D();
+            }
+        }
+    }
+    return res;
+}
+
+void SPSSMLTIntegrator::Mutate(ScratchBuffer &scratchBuffer, MCMCTile* tile, 
+                               const bool shiftMapping) {
+    SampledWavelengths lambda;
+    tile->sampler->StartIteration(); // Chooses large step or small step
+    if (tile->impCurr == 0.f) {
+        tile->sampler->SetLargeStep(true); // Chain not initialized
+    }
+    tile->proposed = LTile(scratchBuffer, *tile->sampler, tile->pixel(0), &lambda, 
+                           useShiftMapping);
+    tile->impProp = std::accumulate(
+                        tile->proposed.begin(), tile->proposed.begin() + TILE_SIZE, 0.f,
+                        [lambda](Float acc, const SampledSpectrum &s) { 
+                            return acc + c(s, lambda); 
+                    });
+    tile->lambdaProp = lambda;
+    if (tile->sampler->GetLargeStep())
+        tile->AccumulateNorm(tile->impProp, tile->proposed);
+
+    // Just a check in case something bad happen
+    if (std::isnan(tile->impProp) || tile->impProp < 0)
+        LOG_ERROR("Encountered a sample with luminance = %f, ignoring!", tile->impProp);
+}
+
+bool ClassicalMCMC(MCMCTile* tile, Float accept, Float s) {
+    // Compute the acceptance using veach weights
+    bool result; // True if accepted
+    Float currWeight, propWeight;
+    if (accept > 0) {
+        currWeight = 1.f - accept;
+        propWeight = accept;
+        result = (accept == 1.f) || (s < accept);
+    }
+    else {
+        currWeight = 1.f;
+        propWeight = 0.f;
+        result = false;
+    }
+
+    tile->cumulativeWeight += currWeight;
+    if (result)
+        tile->Accept(propWeight);
+    else
+        tile->Reject(propWeight);
+    return result;
+}
+
+void SPSSMLTIntegrator::IndependentChainExploration(int nbSamples) {
+    ThreadLocal<ScratchBuffer> threadScratchBuffers([]() { return ScratchBuffer(); });
+    Film film = camera.GetFilm();
+    ProgressReporter progress(film.PixelBounds().Area(), "Rendering",
+                                Options->quiet);
+    Bounds2i pb = camera.GetFilm().PixelBounds();
+    int width = pb.pMax.x - pb.pMin.x;
+    ParallelFor2D(camera.GetFilm().PixelBounds(), [&](Point2i pPixel) {
+        int px = pPixel.x - pb.pMin.x;
+        int py = pPixel.y - pb.pMin.y;
+        int i = py * width + px;
+        ScratchBuffer &scratchBuffer = threadScratchBuffers.Get();
+        RNG rng(i);
+        MCMCTile* tile = tiles[i];
+        MLTSampler* sampler = tile->sampler;
+        SampledWavelengths lambda;
+
+        for (int mutationCtr = 0; mutationCtr < nbSamples; mutationCtr++) {
+            if (tile->impCurr != 0.f) {
+                tile->nbSamples++;
+                Mutate(scratchBuffer, tile, useShiftMapping);
+                Float accept = tile->impCurr == 0.0 ? \
+                                1.0 : std::min<Float>(1, tile->impProp / tile->impCurr);
+                bool accepted = ClassicalMCMC(tile, accept, rng.Uniform<Float>());
+                if (!tile->sampler->GetLargeStep()) {
+                    tile->nbSmallMut++;
+                    if (accepted)
+                        tile->nbSmallMutAcc++;
+                }
+            }
+            else {
+                if (algo == EInitNaive || algo == EInitBruteForce || algo == EInitMCMC){
+                    Mutate(scratchBuffer, tile, useShiftMapping);
+                    Float accept = tile->impCurr == 0.0 ? \
+                                1.0 : std::min<Float>(1, tile->impProp / tile->impCurr);
+                    bool accepted = ClassicalMCMC(tile, accept, rng.Uniform<Float>());
+                }
+                else {
+                    if (rng.Uniform<Float>() < sampler->GetLargeStepProbability()) {
+                        Mutate(scratchBuffer, tile, useShiftMapping);
+                        tile->Reject(0.f);
+                    }
+                }
+            }
+        }
+        tile->Flush();
+        progress.Update();
+        scratchBuffer.Reset();
+    });
+    progress.Done();
+}
+
+// void SPSSMLTIntegrator::scaleGlobally(size_t pixelCount, SampledSpectrum *accum) {
+//     /* Compute the luminance correction factor */
+//     Float avgLuminance = 0;
+//     for (size_t i = 0; i < pixelCount; ++i) {
+//         Float currLum = c(accum[i], );
+//         if (!std::isfinite(currLum)) {
+//         } else {
+//             avgLuminance += currLum;
+//         }
+//     }
+
+//     avgLuminance /= (Float) pixelCount;
+
+//     Float luminanceFactor = m_config.luminance / avgLuminance;
+
+//     for (size_t i = 0; i < pixelCount; ++i) {
+//         // No Direct added
+//         Float correction = luminanceFactor;
+//         Spectrum value = accum[i] * correction;
+//         accum[i] = value;
+//     }
+// }
+
+void SPSSMLTIntegrator::Render() {
+    // Handle statistics and debugstart for PSSMLTIntegrator
+    if (Options->recordPixelStatistics)
+        StatsEnablePixelStats(camera.GetFilm().PixelBounds(),
+                              RemoveExtension(camera.GetFilm().GetFilename()));
+
+    thread_local MLTSampler *threadSampler = nullptr;
+    thread_local int threadDepth;
+
+    Timer timer;
+    // Allocate scratch buffers for MLT samples
+    ThreadLocal<ScratchBuffer> threadScratchBuffers([]() { return ScratchBuffer(); });
+
+    Film film = camera.GetFilm();
+    int it = 1;
+
+    InitTiles();
+
+    InitializeChains(16); // iterations ?
+
+    Float luminance = ComputeAverageLuminance(1000000);
+    meanLuminance = (luminance + (it - 1) * meanLuminance) / it;
+
+    int spp = 32;
+    IndependentChainExploration(spp);
+    
+    VisibleSurface visibleSurface;
+    bool initializeVisibleSurface = camera.GetFilm().UsesVisibleSurface();
+    std::vector<int> sampleCounts(film.PixelBounds().Area());
+    std::vector<RGB> accumBuffer(film.PixelBounds().Area());
+
+    bool useNorm = true;
+    bool splatCenter = false;
+
+    ParallelFor(0, tiles.size(), [&](int i) {
+        MCMCTile* tile = tiles[i];
+        tile->resetScale();
+        tile->scaleNbSamples();
+    });
+
+    // Add tiles into image
+    Bounds2i pb = camera.GetFilm().PixelBounds();
+    const Point2i imgSize = {pb.pMax.x, pb.pMax.y};
+    int width = pb.pMax.x - pb.pMin.x;
+    ParallelFor(0, tiles.size(), [&](int i) {
+        MCMCTile* tile = tiles[i];
+        Float curr_norm = useNorm ? tile->getNorm() : 1.0;
+        // int sampleCount = useNorm ? tile->getNormSamples() : 1;
+        int sampleCount = useNorm ? tile->nbSamples : 1;
+
+        if (splatCenter) {
+            Point2i pixelLocation = tile->pixel(0);
+            RGB pixelL = film.ToOutputRGB(tile->pixels[ECur].values, film.SampleWavelengths(0.5));
+            RGB normalizedValue = pixelL * curr_norm;
+
+            accumBuffer[i] += normalizedValue;
+            sampleCounts[i] += sampleCount;
+        }
+        else {
+            for (int j = 0; j < TILE_SIZE; ++j) {
+                Point2i pixelLocation = tile->pixel(j);
+                if (pixelLocation.x < 0 || pixelLocation.x >= pb.pMax.x || \
+                    pixelLocation.y < 0 || pixelLocation.y >= pb.pMax.y)
+                    continue;
+                int bufferIndex = pixelLocation.y * width + pixelLocation.x;
+                RGB pixelL = film.ToOutputRGB(tile->pixels[j].values, film.SampleWavelengths(0.5));
+                // RGB pixelL = film.ToOutputRGB(tile->get(j), film.SampleWavelengths(0.5));
+                RGB normalizedValue = pixelL * curr_norm;
+
+                accumBuffer[bufferIndex] += normalizedValue;
+                sampleCounts[bufferIndex] += sampleCount;
+            }
+        }
+    });
+
+    // ScaleGlobally(accumBuffer.size(), accumBuffer.data());
+    TileIterativeReweighted solver = TileIterativeReweighted(film.PixelBounds(), tiles, 50);
+    std::vector<RGB> result = solver.solve(film);
+
+    ImageMetadata metadata;
+    Point2i resolution = film.GetImage(&metadata).Resolution();
+    // FilmBaseParameters params(resolution, film.PixelBounds(), film.GetFilter(), 
+    //                           film.Diagonal(), film.GetPixelSensor(), film.GetFilename());
+    // RGBFilm resultFilm = RGBFilm(params, colorSpace);
+    Image resultImg = Image(PixelFormat::Float, resolution, {"R", "G", "B"});
+    ParallelFor2D(camera.GetFilm().PixelBounds(), [&](Point2i pPixel) {
+        int px = pPixel.x - pb.pMin.x;
+        int py = pPixel.y - pb.pMin.y;
+        int i = py * width + px;
+        resultImg.SetChannels(pPixel, {result[i].r, result[i].g, result[i].b});
+    });
+    // resultFilm.ptr()
+
+    // ParallelFor2D(camera.GetFilm().PixelBounds(), [&](Point2i pPixel) {
+    //     int px = pPixel.x - pb.pMin.x;
+    //     int py = pPixel.y - pb.pMin.y;
+    //     int i = py * width + px;
+    //     if (sampleCounts[i] != 0) {
+    //         // TODO: Needs to be changed for spectral
+    //         RGB pix = accumBuffer[i] / (Float)sampleCounts[i];
+    //         resultImg.SetChannels(pPixel, {pix.r, pix.g, pix.b});
+    //     }
+    //         // film.AddSample(pPixel, accumBuffer[i] / (Float)sampleCounts[i], 
+    //         //                tiles[i]->lambdaCurr,
+    //         //                initializeVisibleSurface ? &visibleSurface : nullptr, 1.0); 
+        
+    // });
+
+    if (renderLightSeparately){
+        RenderDirectLights(film, log(1 + timer.ElapsedSeconds()));
+    }
+
+    // Store final image
+    metadata.renderTimeSeconds = timer.ElapsedSeconds();
+    camera.InitMetadata(&metadata);
+    camera.GetFilm().WriteImage(metadata, 1.0);
+    resultImg.Write(film.GetFilename(), metadata);
+    DisconnectFromDisplayServer();
+
+    for (MCMCTile* t : tiles) {
+        delete t;
+    }
+    tiles.clear();
+}
+
+std::string SPSSMLTIntegrator::ToString() const {
+    return StringPrintf("[ SPSSMLTIntegrator camera: %s maxDepth: %d nBootstrap: %d "
                         "nChains: %d mutationsPerPixel: %d sigma: %f "
                         "largeStepProbability: %f lightSampler: %s regularize: %s ]",
                         camera, maxDepth, nBootstrap, nChains, mutationsPerPixel, sigma,
                         largeStepProbability, lightSampler, regularize);
 }
 
-std::unique_ptr<SMCMCIntegrator> SMCMCIntegrator::Create(
-    const ParameterDictionary &parameters, Camera camera, Primitive aggregate,
-    std::vector<Light> lights, const FileLoc *loc) {
+std::unique_ptr<SPSSMLTIntegrator> SPSSMLTIntegrator::Create(
+    const ParameterDictionary &parameters, const RGBColorSpace *colorSpace,
+    Camera camera, Primitive aggregate, std::vector<Light> lights, const FileLoc *loc) {
     if (!camera.Is<PerspectiveCamera>())
         ErrorExit("Only the \"perspective\" camera is currently supported with the "
                   "\"smcmc\" integrator.");
@@ -3749,6 +4224,7 @@ std::unique_ptr<SMCMCIntegrator> SMCMCIntegrator::Create(
     Float largeStepProbability = parameters.GetOneFloat("largestepprobability", 0.3f);
     Float sigma = parameters.GetOneFloat("sigma", .01f);
     std::string techniqueStr = parameters.GetOneString("pathsampling", "unidirectional");
+    renderLightSeparately = parameters.GetOneBool("renderLightSeparately", true);
     if (techniqueStr == "unidirectional"){
         technique = SamplingTechnique::Unidirectional;
     }
@@ -3763,9 +4239,9 @@ std::unique_ptr<SMCMCIntegrator> SMCMCIntegrator::Create(
         nBootstrap = std::max(1, nBootstrap / 16);
     }
     bool regularize = parameters.GetOneBool("regularize", false);
-    return std::make_unique<SMCMCIntegrator>(camera, aggregate, lights, maxDepth,
+    return std::make_unique<SPSSMLTIntegrator>(camera, aggregate, lights, maxDepth,
                                            nBootstrap, nChains, mutationsPerPixel, sigma,
-                                           largeStepProbability, regularize);
+                                           largeStepProbability, regularize, colorSpace);
 }
 
 STAT_RATIO("Stochastic Progressive Photon Mapping/Visible points checked per photon "
@@ -4693,9 +5169,9 @@ std::unique_ptr<Integrator> Integrator::Create(
     else if (name == "mlt")
         integrator = MLTIntegrator::Create(parameters, camera, aggregate, lights, loc);
     else if (name == "pssmlt")
-        integrator = PSSMLTIntegrator::Create(parameters, camera, aggregate, lights, loc);
-    else if (name == "smcmc")
-        integrator = SMCMCIntegrator::Create(parameters, camera, aggregate, lights, loc);
+        integrator = PSSMLTIntegrator::Create(parameters, colorSpace, camera, aggregate, lights, loc);
+    else if (name == "spssmlt")
+        integrator = SPSSMLTIntegrator::Create(parameters, colorSpace, camera, aggregate, lights, loc);
     else if (name == "ambientocclusion")
         integrator = AOIntegrator::Create(parameters, &colorSpace->illuminant, camera,
                                           sampler, aggregate, lights, loc);
